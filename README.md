@@ -1,4 +1,5 @@
 # Cocolet
+### Experimental software
 
 Cocolet is a browser-based Cashu web wallet and developer test harness built on the official `@cashu/coco-*` package line.
 
