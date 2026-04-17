@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import {
+  clearFaults,
+  describeFaultEndpoint,
+  describeFaultKind,
+  getFaultsSnapshot,
+  queueFault,
+  subscribeToFaults,
+} from "../coco/faults";
 import { useCoco } from "../hooks/useCoco";
 import type { UseMintsResult } from "../hooks/useMints";
 import { toErrorMessage } from "../lib/errors";
@@ -9,13 +17,35 @@ type AdversarialPanelProps = {
   onRefreshAll: () => Promise<void>;
 };
 
+type PrivateWalletService = {
+  clearCache: (mintUrl: string) => void;
+  refreshWallet: (mintUrl: string) => Promise<unknown>;
+};
+
 function normalizeTimestamp(timestamp: number): number {
   return timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1_000;
+}
+
+function hasWalletCacheService(value: unknown): value is { walletService: PrivateWalletService } {
+  if (typeof value !== "object" || value === null || !("walletService" in value)) {
+    return false;
+  }
+
+  const walletService = Reflect.get(value, "walletService");
+  return (
+    typeof walletService === "object" &&
+    walletService !== null &&
+    "clearCache" in walletService &&
+    typeof Reflect.get(walletService, "clearCache") === "function" &&
+    "refreshWallet" in walletService &&
+    typeof Reflect.get(walletService, "refreshWallet") === "function"
+  );
 }
 
 export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelProps) {
   const { manager } = useCoco();
   const trustedMints = useMemo(() => mintsState.mints.filter((mint) => mint.trusted), [mintsState.mints]);
+  const faults = useSyncExternalStore(subscribeToFaults, getFaultsSnapshot, getFaultsSnapshot);
   const [mintUrl, setMintUrl] = useState("");
   const [customToken, setCustomToken] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -27,11 +57,148 @@ export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelP
     proofWatcherEnabled: true,
   });
 
+  const visibleFaults = useMemo(
+    () => faults.filter((fault) => (mintUrl ? fault.mintUrl === mintUrl : true)),
+    [faults, mintUrl],
+  );
+
   useEffect(() => {
     if (!mintUrl && trustedMints[0]) {
       setMintUrl(trustedMints[0].mintUrl);
     }
   }, [mintUrl, trustedMints]);
+
+  function requireMintUrl(): string {
+    if (!mintUrl) {
+      throw new Error("Select a trusted mint first.");
+    }
+
+    return mintUrl;
+  }
+
+  function getWalletCacheService(): PrivateWalletService {
+    const privateManager = manager as unknown;
+
+    if (!hasWalletCacheService(privateManager)) {
+      throw new Error("Wallet cache controls are unavailable in this coco build.");
+    }
+
+    return privateManager.walletService;
+  }
+
+  async function refreshWalletCache(targetMintUrl: string): Promise<void> {
+    const walletCacheService = getWalletCacheService();
+    walletCacheService.clearCache(targetMintUrl);
+    await walletCacheService.refreshWallet(targetMintUrl);
+  }
+
+  async function cleanupSendDrill(operationId: string, targetMintUrl: string): Promise<string> {
+    await manager.ops.send.recovery.run().catch(() => undefined);
+
+    const current = await manager.ops.send.get(operationId).catch(() => null);
+
+    if (current?.state === "prepared") {
+      await manager.ops.send.cancel(operationId).catch(() => undefined);
+    }
+
+    if (current?.state === "pending") {
+      await manager.ops.send.reclaim(operationId).catch(() => undefined);
+    }
+
+    getWalletCacheService().clearCache(targetMintUrl);
+    const refreshed = await manager.ops.send.get(operationId).catch(() => null);
+    return refreshed?.state ?? current?.state ?? "missing";
+  }
+
+  async function prepareSwapDrill(targetMintUrl: string) {
+    const spendableBalance = await manager.wallet.getSpendableBalance(targetMintUrl);
+
+    if (spendableBalance < 1) {
+      throw new Error("These swap drills need at least 1 sat of spendable balance on the selected mint.");
+    }
+
+    const { publicKeyHex } = await manager.keyring.generateKeyPair();
+    const prepared = await manager.ops.send.prepare({
+      mintUrl: targetMintUrl,
+      amount: 1,
+      target: {
+        type: "p2pk",
+        pubkey: publicKeyHex,
+      },
+    });
+
+    if (!prepared.needsSwap) {
+      throw new Error("Expected the P2PK drill send to require a swap, but coco prepared an exact send instead.");
+    }
+
+    return prepared;
+  }
+
+  async function runSwapFaultDrill(input: {
+    title: string;
+    kind: Parameters<typeof queueFault>[0]["kind"];
+    description: string;
+    beforeExecute?: (targetMintUrl: string) => Promise<void>;
+  }) {
+    const targetMintUrl = requireMintUrl();
+    clearFaults(targetMintUrl);
+
+    const prepared = await prepareSwapDrill(targetMintUrl);
+
+    queueFault({
+      kind: input.kind,
+      mintUrl: targetMintUrl,
+      endpoint: "swap",
+      description: input.description,
+    });
+
+    try {
+      await input.beforeExecute?.(targetMintUrl);
+      await manager.ops.send.execute(prepared.id);
+      const finalState = await cleanupSendDrill(prepared.id, targetMintUrl);
+      setStatusMessage(
+        `${input.title} did not block the swap request. Cleanup reclaimed the test send and left the operation in '${finalState}'.`,
+      );
+    } catch (error) {
+      const finalState = await cleanupSendDrill(prepared.id, targetMintUrl);
+      setStatusMessage(
+        `${input.title} correctly interrupted the swap drill.\n${toErrorMessage(error)}\nOperation state after cleanup: ${finalState}`,
+      );
+    } finally {
+      clearFaults(targetMintUrl);
+    }
+  }
+
+  async function runKeysetRotationDrill() {
+    const targetMintUrl = requireMintUrl();
+    clearFaults(targetMintUrl);
+
+    const prepared = await prepareSwapDrill(targetMintUrl);
+
+    queueFault({
+      kind: "keyset_rotation_mid_operation",
+      mintUrl: targetMintUrl,
+      endpoint: "keysets",
+      description: "Rotate the advertised active keyset during the wallet refresh that happens before send execution.",
+    });
+
+    try {
+      getWalletCacheService().clearCache(targetMintUrl);
+      await manager.ops.send.execute(prepared.id);
+      const finalState = await cleanupSendDrill(prepared.id, targetMintUrl);
+      setStatusMessage(
+        `Keyset rotation did not interrupt execution. Cleanup reclaimed the test send and left the operation in '${finalState}'.`,
+      );
+    } catch (error) {
+      const finalState = await cleanupSendDrill(prepared.id, targetMintUrl);
+      setStatusMessage(
+        `Keyset rotation correctly broke the in-flight send during wallet refresh.\n${toErrorMessage(error)}\nOperation state after cleanup: ${finalState}`,
+      );
+    } finally {
+      clearFaults(targetMintUrl);
+      getWalletCacheService().clearCache(targetMintUrl);
+    }
+  }
 
   async function runAction(action: () => Promise<void>) {
     setBusy(true);
@@ -51,9 +218,13 @@ export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelP
     <section className="panel-stack">
       <div className="section-card">
         <div className="section-header">
-          <div>
+          <div className="section-copy">
             <p className="eyebrow">Adversarial lab</p>
             <h2>Failure drills, recovery paths, and safety validation</h2>
+            <p className="supporting-text">
+              The new swap drills run against a 1 sat P2PK send so they hit the real mint request path. If a drill
+              unexpectedly succeeds, Cocolet immediately tries to reclaim the test send and clear the wallet cache.
+            </p>
           </div>
         </div>
 
@@ -67,9 +238,111 @@ export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelP
               </option>
             ))}
           </select>
+          <span className="field__hint">Swap drills need at least 1 sat of spendable balance on this mint.</span>
         </label>
 
+        <div className="section-card section-card--nested">
+          <div className="section-header">
+            <div className="section-copy">
+              <h3>Armed faults</h3>
+              <p className="supporting-text">
+                Faults are one-shot. They clear themselves after the next matching request or when you reset them here.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              className="btn btn--ghost"
+              disabled={busy || visibleFaults.length === 0}
+              onClick={() => {
+                clearFaults(mintUrl || undefined);
+                setStatusMessage("Cleared all armed faults for the current scope.");
+              }}
+            >
+              Clear armed faults
+            </button>
+          </div>
+
+          {visibleFaults.length === 0 ? (
+            <p className="supporting-text">No faults are currently armed.</p>
+          ) : (
+            <div className="fault-list">
+              {visibleFaults.map((fault) => (
+                <article key={fault.id} className="fault-card">
+                  <strong>{describeFaultKind(fault.kind)}</strong>
+                  <span>{describeFaultEndpoint(fault.endpoint)}</span>
+                  <p>{fault.description}</p>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div className="button-grid">
+          <button
+            type="button"
+            className="btn btn--warning"
+            disabled={busy}
+            onClick={() =>
+              runAction(async () => {
+                await runSwapFaultDrill({
+                  title: "Network failure",
+                  kind: "network_failure",
+                  description: "Drop the next /v1/swap call to simulate a mint or transport outage mid-send.",
+                });
+              })
+            }
+          >
+            Simulate swap network failure
+          </button>
+
+          <button
+            type="button"
+            className="btn btn--warning"
+            disabled={busy}
+            onClick={() =>
+              runAction(async () => {
+                await runSwapFaultDrill({
+                  title: "Partial mint response",
+                  kind: "partial_mint_response",
+                  description: "Return an incomplete /v1/swap payload so the wallet sees a truncated mint response.",
+                });
+              })
+            }
+          >
+            Simulate partial swap response
+          </button>
+
+          <button
+            type="button"
+            className="btn btn--warning"
+            disabled={busy}
+            onClick={() =>
+              runAction(async () => {
+                await runSwapFaultDrill({
+                  title: "Invalid signatures",
+                  kind: "invalid_signatures",
+                  description: "Corrupt the first swap signature so proof construction fails during unblinding.",
+                });
+              })
+            }
+          >
+            Simulate invalid swap signatures
+          </button>
+
+          <button
+            type="button"
+            className="btn btn--warning"
+            disabled={busy}
+            onClick={() =>
+              runAction(async () => {
+                await runKeysetRotationDrill();
+              })
+            }
+          >
+            Simulate keyset rotation
+          </button>
+
           <button
             type="button"
             className="btn btn--secondary"
@@ -186,12 +459,9 @@ export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelP
             disabled={busy}
             onClick={() =>
               runAction(async () => {
-                if (!mintUrl) {
-                  throw new Error("Select a trusted mint first.");
-                }
-
-                await manager.wallet.restore(mintUrl);
-                setStatusMessage(`Restore completed for ${mintUrl}.`);
+                const targetMintUrl = requireMintUrl();
+                await manager.wallet.restore(targetMintUrl);
+                setStatusMessage(`Restore completed for ${targetMintUrl}.`);
               })
             }
           >
@@ -307,6 +577,21 @@ export function AdversarialPanel({ mintsState, onRefreshAll }: AdversarialPanelP
             }
           >
             Check pending mints
+          </button>
+
+          <button
+            type="button"
+            className="btn btn--ghost"
+            disabled={busy}
+            onClick={() =>
+              runAction(async () => {
+                const targetMintUrl = requireMintUrl();
+                await refreshWalletCache(targetMintUrl);
+                setStatusMessage(`Forced a fresh wallet reload for ${targetMintUrl}.`);
+              })
+            }
+          >
+            Refresh wallet cache
           </button>
         </div>
 

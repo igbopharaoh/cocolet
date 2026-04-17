@@ -1,5 +1,6 @@
 import { ConsoleLogger, initializeCoco, type Manager } from "@cashu/coco-core";
 import { IndexedDbRepositories } from "@cashu/coco-indexeddb";
+import { installFaultInjection } from "./faults";
 import { mnemonicToSeedBytes, normalizeMnemonic } from "./seed";
 
 export const COCO_DB_NAME = "cocolet-wallet";
@@ -62,7 +63,10 @@ export async function getWalletRuntime(mnemonic: string): Promise<WalletRuntime>
       fastPollingIntervalMs: 5_000,
     },
   })
-    .then((manager) => ({ manager, repo }))
+    .then((manager) => {
+      installFaultInjection(manager);
+      return { manager, repo };
+    })
     .catch((error) => {
       runtimePromise = null;
       activeMnemonic = null;

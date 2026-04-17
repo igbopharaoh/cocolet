@@ -379,6 +379,11 @@ img {
   line-height: 1.35;
 }
 
+.field__hint {
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
 .label-with-action {
   display: flex;
   justify-content: space-between;
@@ -726,6 +731,27 @@ img {
   font-family: var(--mono);
   overflow: auto;
   white-space: pre-wrap;
+}
+
+.fault-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+.fault-card {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.95rem;
+  border-radius: 18px;
+  border: 1px solid rgba(86, 66, 42, 0.12);
+  background: rgba(255, 252, 247, 0.88);
+}
+
+.fault-card span,
+.fault-card p {
+  margin: 0;
+  color: var(--muted);
 }
 
 .modal-backdrop {
